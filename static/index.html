@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XYZ Bank Assistant</title>
+<style>
+  :root { --saffron: #f2b134; --coral: #d6453d; --bg: #0a4a40; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(circle at 50% 35%, #0e6b5c, var(--bg) 70%);
+    color: #eaf4f0; font-family: "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 36px;
+  }
+  .orb-wrap { position: relative; width: 220px; height: 220px; display: grid; place-items: center; }
+  .ring { position: absolute; inset: 0; border-radius: 50%; border: 2px solid var(--saffron); opacity: 0; }
+  .orb {
+    width: 140px; height: 140px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #3d8f80, #1b6f60 60%, #145a4d);
+    transform: scale(calc(1 + var(--level, 0) * 0.35));
+    transition: transform .08s linear, background .3s;
+  }
+  [data-state="listening"] .orb,
+  [data-state="speaking"] .orb { background: radial-gradient(circle at 35% 30%, #ffd77a, var(--saffron) 60%, #d98f12); }
+  [data-state="connecting"] .orb { animation: breathe 1.2s ease-in-out infinite; }
+  [data-state="speaking"] .ring { animation: ripple 1.6s ease-out infinite; }
+  [data-state="speaking"] .ring.r2 { animation-delay: .8s; }
+  @keyframes ripple { 0% { transform: scale(.65); opacity: .7; } 100% { transform: scale(1.1); opacity: 0; } }
+  @keyframes breathe { 50% { transform: scale(1.1); } }
+
+  #status { font-size: 1rem; color: #a9c9c0; min-height: 1.4em; margin: 0; }
+
+  #callBtn {
+    border: 0; cursor: pointer; width: 72px; height: 72px; border-radius: 50%;
+    background: #1fb36b; color: #fff; display: grid; place-items: center;
+    transition: transform .15s, background .2s;
+  }
+  #callBtn:hover:not(:disabled) { transform: scale(1.06); }
+  #callBtn.live { background: var(--coral); }
+  #callBtn:disabled { opacity: .6; cursor: default; }
+  #callBtn:focus-visible { outline: 3px solid #fff; outline-offset: 4px; }
+  #callBtn svg { width: 30px; height: 30px; fill: currentColor; }
+  #callBtn.live svg { transform: rotate(135deg); }
+
+  @media (prefers-reduced-motion: reduce) { .ring, .orb { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body data-state="idle" id="root">
+  <div class="orb-wrap">
+    <div class="ring r1"></div>
+    <div class="ring r2"></div>
+    <div class="orb" id="orb"></div>
+  </div>
+  <p id="status" aria-live="polite">Tap to call</p>
+  <button id="callBtn" aria-label="Start call">
+    <svg viewBox="0 0 24 24"><path d="M6.6 10.8a15.1 15.1 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.25c1.1.37 2.3.57 3.6.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.6a1 1 0 0 1-.25 1z"/></svg>
+  </button>
+
+<script>
+const INPUT_RATE = 16000;
+const OUTPUT_RATE = 24000;
+
+const root = document.getElementById("root");
+const callBtn = document.getElementById("callBtn");
+const statusEl = document.getElementById("status");
+const orb = document.getElementById("orb");
+
+let ws = null, micStream = null, micCtx = null, micNode = null, playCtx = null;
+let nextPlayTime = 0;
+let activeSources = [];
+let inCall = false;
+
+const LABELS = {
+  idle: "Tap to call",
+  connecting: "Connecting…",
+  listening: "Listening",
+  speaking: "Speaking",
+  ended: "Call ended",
+};
+function setState(name, label) {
+  root.dataset.state = name === "ended" ? "idle" : name;
+  statusEl.textContent = label || LABELS[name];
+}
+
+// ---------- Bot audio playback ----------
+function playChunk(arrayBuffer) {
+  if (!playCtx) return;
+  const int16 = new Int16Array(arrayBuffer);
+  const float = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float[i] = int16[i] / 32768;
+
+  const buffer = playCtx.createBuffer(1, float.length, OUTPUT_RATE);
+  buffer.copyToChannel(float, 0);
+
+  const src = playCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(playCtx.destination);
+
+  const now = playCtx.currentTime;
+  if (nextPlayTime < now + 0.02) nextPlayTime = now + 0.05;
+  src.start(nextPlayTime);
+  nextPlayTime += buffer.duration;
+
+  activeSources.push(src);
+  if (inCall) setState("speaking");
+  src.onended = () => {
+    activeSources = activeSources.filter(s => s !== src);
+    if (activeSources.length === 0 && inCall) setState("listening");
+  };
+}
+
+function stopPlayback() {
+  activeSources.forEach(s => { try { s.stop(); } catch (e) {} });
+  activeSources = [];
+  nextPlayTime = 0;
+  if (inCall) setState("listening");
+}
+
+// ---------- Microphone capture ----------
+const WORKLET_CODE = `
+class MicProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice());
+    return true;
+  }
+}
+registerProcessor("mic-processor", MicProcessor);
+`;
+
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  micCtx = new AudioContext();
+  const url = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
+  await micCtx.audioWorklet.addModule(url);
+
+  const source = micCtx.createMediaStreamSource(micStream);
+  micNode = new AudioWorkletNode(micCtx, "mic-processor");
+
+  const mute = micCtx.createGain();
+  mute.gain.value = 0;
+  source.connect(micNode);
+  micNode.connect(mute);
+  mute.connect(micCtx.destination);
+
+  const ratio = micCtx.sampleRate / INPUT_RATE;
+  let pending = new Float32Array(0);
+  let pos = 0;
+  let outBuf = [];
+
+  micNode.port.onmessage = (event) => {
+    if (!inCall || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const input = event.data;
+
+    // Mic level makes the orb pulse while you talk.
+    let sum = 0;
+    for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+    const level = Math.min(1, Math.sqrt(sum / input.length) * 6);
+    orb.style.setProperty("--level", root.dataset.state === "listening" ? level.toFixed(2) : "0");
+
+    const joined = new Float32Array(pending.length + input.length);
+    joined.set(pending);
+    joined.set(input, pending.length);
+
+    while (pos + 1 < joined.length) {
+      const i = Math.floor(pos);
+      const frac = pos - i;
+      const s = joined[i] * (1 - frac) + joined[i + 1] * frac;
+      outBuf.push(Math.max(-1, Math.min(1, s)));
+      pos += ratio;
+    }
+    const used = Math.floor(pos);
+    pending = joined.slice(used);
+    pos -= used;
+
+    if (outBuf.length >= 1600) {
+      const int16 = new Int16Array(outBuf.length);
+      for (let i = 0; i < outBuf.length; i++) {
+        int16[i] = outBuf[i] < 0 ? outBuf[i] * 32768 : outBuf[i] * 32767;
+      }
+      ws.send(int16.buffer);
+      outBuf = [];
+    }
+  };
+}
+
+// ---------- Call start / end ----------
+async function startCall() {
+  callBtn.disabled = true;
+  setState("connecting");
+
+  try {
+    playCtx = new AudioContext();
+    await playCtx.resume();
+    await startMic();
+  } catch (err) {
+    setState("idle", "Microphone error: " + err.message);
+    callBtn.disabled = false;
+    cleanup();
+    return;
+  }
+
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${scheme}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    inCall = true;
+    callBtn.classList.add("live");
+    callBtn.setAttribute("aria-label", "End call");
+    callBtn.disabled = false;
+  };
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) { playChunk(event.data); return; }
+    const msg = JSON.parse(event.data);
+    if (msg.type === "status") setState("listening");
+    else if (msg.type === "interrupted") stopPlayback();
+    else if (msg.type === "error") setState("idle", "Error: " + msg.text);
+  };
+
+  ws.onclose = () => { if (inCall) endCall(); };
+  ws.onerror = () => setState("idle", "Can’t reach the server");
+}
+
+function cleanup() {
+  inCall = false;
+  stopPlayback();
+  orb.style.setProperty("--level", "0");
+  if (micNode) { micNode.port.onmessage = null; micNode.disconnect(); micNode = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (micCtx) { micCtx.close(); micCtx = null; }
+  if (playCtx) { playCtx.close(); playCtx = null; }
+}
+
+function endCall() {
+  cleanup();
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  callBtn.classList.remove("live");
+  callBtn.setAttribute("aria-label", "Start call");
+  callBtn.disabled = false;
+  setState("ended");
+}
+
+callBtn.addEventListener("click", () => { if (inCall) endCall(); else startCall(); });
+</script>
+</body>
+</html>
