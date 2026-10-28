@@ -44,6 +44,15 @@ SYSTEM_INSTRUCTION = f"""
 APPROVED FIXED DEPOSIT KNOWLEDGE:
 {knowledge}
 
+LANGUAGE RULES (VERY IMPORTANT):
+- Speak ONLY in English, in every reply, for the whole call.
+- Never switch language, even if the caller's words sound like another
+  language or the audio is unclear.
+- If you cannot understand the caller, say in English: "Sorry, I didn't
+  catch that. Could you please repeat?"
+- If the caller asks for another language, politely say in English that
+  only English is supported right now.
+
 VOICE CONVERSATION RULES:
 - You are the AI voice assistant for fictional XYZ Bank.
 - Greet the caller once, then wait for their response.
@@ -64,7 +73,7 @@ VOICE CONVERSATION RULES:
 """
 
 GREETING_PROMPT = (
-    "Greet the user once as the AI assistant for XYZ Bank. "
+    "Greet the user once, in English, as the AI assistant for XYZ Bank. "
     "Ask how you can help with the long-term fixed deposit. "
     "Then wait for the user to speak. Do not end the conversation "
     "after the greeting."
@@ -155,6 +164,9 @@ async def voice_socket(ws: WebSocket):
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=SYSTEM_INSTRUCTION,
+        # Keeps the bot's voice in English. If your model rejects this
+        # line with an error, delete it; the prompt rules still apply.
+        speech_config=types.SpeechConfig(language_code="en-US"),
         input_audio_transcription={},
         output_audio_transcription={},
     )
